@@ -1,0 +1,130 @@
+name: Build MinIO images from source
+
+# Builds acpvx/minio:<RELEASE>-src and acpvx/mc:<MC_RELEASE>-src from the
+# release tags of this fork and of acpvarchitects/mc (see acpv/Dockerfile).
+# Each image is smoke-tested (versions, healthcheck binaries, S3 put/get)
+# before it is pushed. The "-src" suffix keeps these apart from the
+# unchanged upstream images preserved under the bare tag.
+#
+# Public repo: GitHub-hosted runners only, never self-hosted.
+
+on:
+    workflow_dispatch:
+        inputs:
+            releases:
+                description: "Server tags, space separated"
+                default: "RELEASE.2025-04-22T22-12-26Z RELEASE.2025-09-07T16-13-09Z RELEASE.2025-10-15T17-29-55Z"
+            mc_release:
+                description: "mc tag (bundled in the server image and built as acpvx/mc)"
+                default: "RELEASE.2025-08-13T08-35-41Z"
+            push:
+                description: "Push to Docker Hub after the smoke test"
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+
+jobs:
+    matrix:
+        runs-on: ubuntu-latest
+        outputs:
+            releases: ${{ steps.m.outputs.releases }}
+        steps:
+            - id: m
+              env:
+                  RELEASES: ${{ inputs.releases }}
+              run: echo "releases=$(printf '%s\n' $RELEASES | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+    minio:
+        needs: matrix
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                release: ${{ fromJSON(needs.matrix.outputs.releases) }}
+        env:
+            IMAGE: acpvx/minio:${{ matrix.release }}-src
+            RELEASE: ${{ matrix.release }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: docker/setup-buildx-action@v3
+
+            - name: Build
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: acpv/Dockerfile
+                  target: minio
+                  build-args: |
+                      RELEASE=${{ matrix.release }}
+                      MC_RELEASE=${{ inputs.mc_release }}
+                  tags: ${{ env.IMAGE }}
+                  load: true
+
+            - name: Smoke test
+              run: |
+                  set -euo pipefail
+                  docker run --rm --entrypoint minio "$IMAGE" --version | tee /tmp/v
+                  grep -q "minio version $RELEASE " /tmp/v
+                  docker run --rm --entrypoint mc "$IMAGE" --version | head -1
+                  docker run --rm --entrypoint curl "$IMAGE" --version | head -1
+
+                  docker run -d --name m -e MINIO_ROOT_USER=smoke -e MINIO_ROOT_PASSWORD=smoke-secret-123 \
+                    "$IMAGE" server /data
+                  for i in $(seq 30); do
+                    docker exec m curl -fs http://localhost:9000/minio/health/live && break
+                    sleep 1
+                  done
+                  docker exec m mc ready local
+                  docker exec m mc alias set local http://localhost:9000 smoke smoke-secret-123
+                  docker exec m mc mb local/smoke
+                  docker exec m sh -c 'echo acpv-smoke > /tmp/obj && mc cp /tmp/obj local/smoke/obj'
+                  test "$(docker exec m mc cat local/smoke/obj)" = "acpv-smoke"
+                  docker rm -f m
+
+            - name: Push
+              if: inputs.push
+              env:
+                  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+                  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+              run: |
+                  echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+                  docker push "$IMAGE"
+
+    mc:
+        runs-on: ubuntu-latest
+        env:
+            IMAGE: acpvx/mc:${{ inputs.mc_release }}-src
+            MC_RELEASE: ${{ inputs.mc_release }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: docker/setup-buildx-action@v3
+
+            - name: Build
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: acpv/Dockerfile
+                  target: mc
+                  build-args: |
+                      MC_RELEASE=${{ inputs.mc_release }}
+                  tags: ${{ env.IMAGE }}
+                  load: true
+
+            - name: Smoke test
+              run: |
+                  set -euo pipefail
+                  docker run --rm "$IMAGE" --version | tee /tmp/v
+                  grep -q "mc version $MC_RELEASE " /tmp/v
+
+            - name: Push
+              if: inputs.push
+              env:
+                  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+                  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+              run: |
+                  echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+                  docker push "$IMAGE"
